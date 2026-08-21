@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 import Link from 'next/link';
 import { UserPlus, Award, Activity, Home, ShieldCheck } from 'lucide-react';
+import { CHAIN_LABEL, IS_LOCAL_CHAIN } from '@/lib/chain/client';
 
 export const metadata: Metadata = {
   title: 'AegisDID — Zero-Knowledge Biometric Identity',
@@ -67,12 +68,18 @@ export default function RootLayout({
               </Link>
             </nav>
 
-            {/* Network Status Badge */}
+            {/* Network badge — reads the configured chain. It must never assert a network the app
+                is not pointed at, and it deliberately does not claim proving "readiness", which is
+                only knowable after the WASM/zkey actually load (see /diagnostics). */}
             <div className="hidden lg:flex items-center space-x-2.5 px-3 py-1.5 rounded-full bg-slate-900/80 border border-slate-800 text-xs font-mono">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-slate-300">Base Sepolia</span>
+              <span
+                className={`w-2 h-2 rounded-full ${IS_LOCAL_CHAIN ? 'bg-amber-400' : 'bg-emerald-400'}`}
+              />
+              <span className="text-slate-300">{CHAIN_LABEL}</span>
               <span className="text-slate-600">|</span>
-              <span className="text-indigo-400 font-semibold">WASM Ready</span>
+              <Link href="/diagnostics" className="text-indigo-400 font-semibold hover:text-indigo-300">
+                Self-test
+              </Link>
             </div>
           </div>
         </header>

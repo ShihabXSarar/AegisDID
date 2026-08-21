@@ -13,6 +13,13 @@ const nextConfig = {
     "localhost",
     "192.168.0.105",
   ],
+  // CRITICAL: Mark native-addon / WASM packages as external so Next.js server-side
+  // doesn't try to webpack-bundle them (which causes "Cannot find module './331.js'" crashes).
+  serverExternalPackages: [
+    'circomlibjs',
+    'ffjavascript',
+    'snarkjs',
+  ],
   webpack: (config, { isServer }) => {
     if (!isServer) {
       config.resolve.fallback = {
