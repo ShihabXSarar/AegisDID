@@ -1,12 +1,14 @@
 /**
  * AegisDID — Client-Side Groth16 ZK Prover
  * Strictly adheres to docs/CRYPTO_SPEC.md.
- * 
- * Runs Groth16 fullProve in WebAssembly when compiled circuit artifacts (.wasm / .zkey) are present.
- * Provides fallback mock proving while Person A is compiling the circuit pipeline.
+ *
+ * Runs snarkjs `groth16.fullProve` in WebAssembly against the compiled circuit artifacts in
+ * public/zk/.
+ *
+ * SECURITY: there is deliberately NO mock/fallback proving path. If the artifacts are missing
+ * or the witness does not satisfy the constraints, this throws. A synthesised proof would be
+ * rejected by the on-chain verifier anyway, and surfacing one as a success would be a lie.
  */
-
-import { computeNullifier } from '../ml/commitments';
 
 export interface CircuitWitness {
   // Public inputs
@@ -40,15 +42,22 @@ export interface ProverResult {
 }
 
 /**
- * Check if the compiled circuit .wasm and .zkey artifacts exist in public/zk/
+ * Check that the compiled circuit .wasm and .zkey artifacts are actually served from public/zk/.
+ *
+ * A Next.js dev server answers unknown paths with an HTML 404 page, so a bare `res.ok` is not
+ * enough — an HTML content-type means the binary is absent and snarkjs would fail deep inside
+ * WASM instantiation with an opaque error.
  */
 async function checkCircuitArtifactsExist(wasmPath: string, zkeyPath: string): Promise<boolean> {
   if (typeof window === 'undefined') return false;
   try {
-    const res = await fetch(wasmPath, { method: 'HEAD' });
-    const cType = res.headers.get('content-type') || '';
-    // If Next.js returns 404 or text/html, the binary is not present
-    return res.ok && !cType.includes('text/html');
+    const [wasmRes, zkeyRes] = await Promise.all([
+      fetch(wasmPath, { method: 'HEAD' }),
+      fetch(zkeyPath, { method: 'HEAD' }),
+    ]);
+    const isBinary = (r: Response) =>
+      r.ok && !(r.headers.get('content-type') || '').includes('text/html');
+    return isBinary(wasmRes) && isBinary(zkeyRes);
   } catch {
     return false;
   }
@@ -106,60 +115,11 @@ export async function generateAegisClaimProof(
         publicSignals,
         provingTimeMs,
       };
-    } catch (snarkErr) {
-      console.warn('Real snarkjs proving failed, switching to local verification:', snarkErr);
+    } catch (snarkErr: any) {
+      console.error('snarkjs proving failed:', snarkErr);
+      throw new Error(`Zero-Knowledge Proof Generation Failed: ${snarkErr.message || 'Constraint violation'}. This usually means your face does not match the enrolled identity or you are not in the cohort.`);
     }
+  } else {
+    throw new Error('Circuit artifacts not found. Please ensure aegis_claim.wasm and aegis_final.zkey exist in the public/zk directory.');
   }
-
-  // Fallback / Development Prover (Active until Person A merges compiled circuits)
-  onProgress?.('Generating client-side ZK witness & nullifier...');
-  await new Promise((r) => setTimeout(r, 1200));
-
-  // Compute exact mathematical nullifier matching CRYPTO_SPEC.md: nf = Poseidon3(idSecret, policyId, epoch)
-  let calculatedNullifier = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
-  try {
-    const idSecretBigInt = BigInt(witness.idSecret);
-    const nfBigInt = await computeNullifier(idSecretBigInt, witness.policyId, witness.epoch);
-    calculatedNullifier = '0x' + nfBigInt.toString(16);
-  } catch (nfErr) {
-    console.warn('Nullifier calculation note:', nfErr);
-  }
-
-  const provingTimeMs = Math.round(performance.now() - startTime);
-  onProgress?.(`ZK Witness & Proof synthesized in ${provingTimeMs}ms`);
-
-  return {
-    proof: {
-      pi_a: [
-        '0x1a8c4d2e9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e',
-        '0x2b9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d',
-      ],
-      pi_b: [
-        [
-          '0x3c0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e',
-          '0x4d1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f',
-        ],
-        [
-          '0x5e2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a',
-          '0x6f3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b',
-        ],
-      ],
-      pi_c: [
-        '0x7a4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c',
-        '0x8b5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d',
-      ],
-      protocol: 'groth16',
-      curve: 'bn128',
-    },
-    publicSignals: [
-      // Exact order: [nullifier, root, policyId, epoch, tauQ, modelHash]
-      calculatedNullifier,
-      formattedWitness.root,
-      formattedWitness.policyId,
-      formattedWitness.epoch,
-      formattedWitness.tauQ,
-      formattedWitness.modelHash,
-    ],
-    provingTimeMs,
-  };
 }

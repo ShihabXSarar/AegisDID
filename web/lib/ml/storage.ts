@@ -13,6 +13,21 @@ export interface StoredIdentity {
   cId: string;      // Hex of C_id (Identity Commitment)
   didKey: string;   // did:key:z6Mk...
   createdAt: string;// ISO timestamp
+  /**
+   * MODEL_HASH bound into C_id at enrollment. A claim can only ever satisfy a policy whose
+   * on-chain modelHash equals this value — the circuit recomputes C_id from the *public*
+   * modelHash, so a different one yields a leaf that is not in the cohort tree.
+   * Optional because identities enrolled before this field existed have no record of it.
+   */
+  modelHash?: string;
+  /** Ed25519 public key behind `didKey`, hex. Safe to publish. */
+  didPublicKey?: string;
+  /**
+   * Ed25519 secret key behind `didKey`, hex. NEVER transmitted — same enclave-only rule as
+   * idSecret and salt. Optional because identities enrolled before real keypairs existed
+   * have no secret key for their DID.
+   */
+  didPrivateKey?: string;
 }
 
 const DB_NAME = 'aegis_did_secure_storage';

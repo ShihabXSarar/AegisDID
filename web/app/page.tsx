@@ -7,7 +7,6 @@ import {
   UserPlus,
   Award,
   Activity,
-  Lock,
   Cpu,
   ArrowRight,
   CheckCircle2,

@@ -6,11 +6,17 @@
     "dev": "next dev -H 0.0.0.0 -p 3000",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test:circuit": "node scripts/circuit_conformance.mts",
+    "test:liveness": "node scripts/liveness_test.mts",
+    "test:quantize": "node scripts/quantize_test.mts",
+    "test": "npm run test:quantize && npm run test:liveness && npm run test:circuit"
   },
   "dependencies": {
     "@mediapipe/camera_utils": "0.3.1675466862",
     "@mediapipe/face_mesh": "0.4.1633559619",
+    "@noble/curves": "^1.9.1",
     "circomlibjs": "^0.1.7",
     "clsx": "^2.1.1",
     "encoding": "^0.1.13",
@@ -24,10 +30,13 @@
     "viem": "^2.23.0"
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.6",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "autoprefixer": "^10.4.20",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^15.5.23",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2"
