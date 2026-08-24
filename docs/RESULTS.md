@@ -182,9 +182,14 @@ Practical consequences:
   See `docs/MODEL_CARD.md`.
 - **No demographic breakdown was measured**, so the prototype cannot show it fails evenly across
   skin tone, age or sex.
-- **Liveness is not exercised at all.** Every input is a still photograph. These figures describe the
-  recognition threshold only; the EAR/yaw liveness check is defeatable by a replay video
-  (`docs/THREAT_MODEL.md`).
+- **Liveness is not exercised at all.** Every input is a still photograph. These figures describe
+  the recognition threshold only. Liveness is a separate, independently tested subsystem
+  (MediaPipe blendshape blink + head-pose challenge, `web/scripts/liveness_test.mts`, 75/75
+  assertions passing) whose tests prove it rejects static photos, occlusions and out-of-order
+  scripted actions — **but it is still defeatable by a replay video or by frame injection**, and
+  no FAR/TAR-style presentation-attack detection rate has been measured for it. There is no
+  measured APCER/BPCER figure in this repository and none should be inferred.
+  See `docs/THREAT_MODEL.md` §2.1.
 - **Both images of every pair are stills.** Production compares an enrolment session against a later
   claim session — different camera, lighting and pose — which is strictly harder than this.
 - **FAR = 0 is not zero**, only below the 2.22 × 10⁻⁶ resolution floor of §2.

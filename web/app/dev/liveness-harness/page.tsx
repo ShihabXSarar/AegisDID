@@ -4,43 +4,94 @@
  * DEVELOPMENT-ONLY liveness harness.
  *
  * ISOLATION (required by the project's security rules): this page exercises the real
- * LivenessTracker against SYNTHETIC landmark traces so the challenge can be verified without a
- * camera. It renders nothing but numbers and it is not reachable from any navigation. It cannot
- * affect a claim: the tracker instances here are local to this component, the page never touches
- * the camera, an embedding, a proof, a wallet, or the chain, and /claim constructs its own tracker.
- * There is no "pass liveness" affordance here — feeding it a static trace fails, exactly as a held
- * photo does at /claim.
+ * LivenessTracker against SYNTHETIC MediaPipe signal traces so the challenge can be verified
+ * without a camera. It renders nothing but numbers and it is not reachable from any navigation.
+ * It cannot affect a claim: the tracker instances here are local to this component, the page
+ * never touches the camera, an embedding, a proof, a wallet, or the chain, and /claim constructs
+ * its own tracker. There is no "pass liveness" affordance here — feeding it a static trace fails,
+ * exactly as a held photo does at /claim.
  *
- * The traces below are the field failure the fix addresses: a real subject whose steady open-eye
- * EAR was 0.277, blinking normally, counted 0 of 1 blinks over 42.9 s.
+ * The traces cover the two field failures the v3 rewrite addresses: a real subject blinking
+ * normally counted 0 of 1 blinks, and moving the camera away counted a phantom blink.
  */
 
 import { useState } from 'react';
-import { LivenessTracker, BLINK_DIP_FACTOR, BLINK_RECOVER_FACTOR, type LandmarkPoint } from '../../../lib/ml/liveness';
+import {
+  LivenessTracker,
+  BLINK_CLOSE_ENTER,
+  BLINK_POSE_LIMIT_DEG,
+  CALIBRATION_FRAMES,
+  REQUIRED_BLINKS,
+  TURN_DEV_DEG,
+  type LivenessSignals,
+  type LivenessState,
+} from '../../../lib/ml/liveness';
 
-const EYE_H = 30;
-const FACE_W = 200;
+const FRAME_MS = 33;
+const OPEN_COEFF = 0.05;
+const CLOSED_COEFF = 0.9;
+const BASE_SCALE = 0.18;
+const BASE_SCALE_PX = 115;
 
-/** Inverts the production EAR/yaw geometry so a requested (ear, yaw) is what the tracker computes. */
-function makeLandmarks(ear: number, yaw: number): LandmarkPoint[] {
-  const pts: LandmarkPoint[] = Array.from({ length: 68 }, () => ({ x: 0, y: 0 }));
-  const v = ear * EYE_H;
-  pts[36] = { x: 0, y: 0 };
-  pts[39] = { x: EYE_H, y: 0 };
-  pts[37] = { x: 10, y: -v / 2 };
-  pts[41] = { x: 10, y: v / 2 };
-  pts[38] = { x: 20, y: -v / 2 };
-  pts[40] = { x: 20, y: v / 2 };
-  pts[45] = { x: 100, y: 0 };
-  pts[42] = { x: 100 + EYE_H, y: 0 };
-  pts[44] = { x: 110, y: -v / 2 };
-  pts[46] = { x: 110, y: v / 2 };
-  pts[43] = { x: 120, y: -v / 2 };
-  pts[47] = { x: 120, y: v / 2 };
-  pts[0] = { x: 0, y: 200 };
-  pts[16] = { x: FACE_W, y: 200 };
-  pts[30] = { x: (FACE_W * yaw) / (1 + yaw), y: 150 };
-  return pts;
+function sig(overrides: Partial<LivenessSignals> = {}): LivenessSignals {
+  return {
+    ok: true,
+    blinkLeft: OPEN_COEFF,
+    blinkRight: OPEN_COEFF,
+    yawDeg: 0,
+    faceScale: BASE_SCALE,
+    faceScalePx: BASE_SCALE_PX,
+    confidence: 0.99,
+    ...overrides,
+  };
+}
+
+/** Deterministic injected clock — no wall-clock waits, no stubbed globals. */
+function makeClock(start = 1_000_000) {
+  let now = start;
+  return {
+    now: () => now,
+    tick: (ms = FRAME_MS) => (now += ms),
+  };
+}
+
+type Clock = ReturnType<typeof makeClock>;
+
+function calibrate(t: LivenessTracker, c: Clock): LivenessState {
+  let s = t.processFrame(sig(), c.now());
+  for (let i = 0; i < CALIBRATION_FRAMES + 2; i++) {
+    c.tick();
+    s = t.processFrame(sig(), c.now());
+  }
+  return s;
+}
+
+/** One physiologically plausible blink: ~100 ms of closure, then a confirmed reopen. */
+function blinkOnce(t: LivenessTracker, c: Clock, yawDeg = 0): LivenessState {
+  let s = t.processFrame(sig({ blinkLeft: CLOSED_COEFF, blinkRight: CLOSED_COEFF, yawDeg }), c.now());
+  for (let i = 0; i < 2; i++) {
+    c.tick();
+    s = t.processFrame(sig({ blinkLeft: CLOSED_COEFF, blinkRight: CLOSED_COEFF, yawDeg }), c.now());
+  }
+  for (let i = 0; i < 4; i++) {
+    c.tick();
+    s = t.processFrame(sig({ yawDeg }), c.now());
+  }
+  return s;
+}
+
+/** Turn away past TURN_DEV_DEG, dwell, return to neutral, dwell. */
+function turnAndReturn(t: LivenessTracker, c: Clock): LivenessState {
+  let s = t.processFrame(sig({ yawDeg: 35 }), c.now());
+  for (let i = 0; i < 15; i++) {
+    c.tick();
+    s = t.processFrame(sig({ yawDeg: 35 }), c.now());
+  }
+  for (let i = 0; i < 15; i++) {
+    c.tick();
+    s = t.processFrame(sig(), c.now());
+  }
+  return s;
 }
 
 interface Row {
@@ -48,9 +99,6 @@ interface Row {
   detail: string;
   ok: boolean;
 }
-
-const OPEN = 0.277;
-const JITTER = [0.277, 0.305, 0.288, 0.316, 0.271, 0.298, 0.322, 0.284, 0.279, 0.311, 0.290, 0.276];
 
 export default function LivenessHarnessPage() {
   const [rows, setRows] = useState<Row[]>([]);
@@ -68,95 +116,187 @@ export default function LivenessHarnessPage() {
     );
   }
 
-  async function run() {
+  function run() {
     setRunning(true);
     setRows([]);
     const out: Row[] = [];
 
-    // --- 1. Field scenario: jittery calibration, then one natural blink ---------------
+    // --- 1. Calibration establishes a neutral pose, not a blink baseline --------------
     {
+      const c = makeClock();
       const t = new LivenessTracker();
-      for (const e of JITTER) t.processFrame(makeLandmarks(e, 1.0));
-      let s = t.processFrame(makeLandmarks(OPEN, 1.0));
-
-      const oldBaseline =
-        [...JITTER].sort((a, b) => b - a).slice(0, 3).reduce((x, v) => x + v, 0) / 3;
+      const s = calibrate(t, c);
       out.push({
-        name: 'old top-3 estimator would be unreachable',
-        detail: `old baseline ${oldBaseline.toFixed(4)} -> recover ${(oldBaseline * 0.88).toFixed(4)} vs open ${OPEN}`,
-        ok: oldBaseline * 0.88 > OPEN,
+        name: 'calibration completes and fixes a neutral yaw baseline',
+        detail: `calibrating=${s.calibrating}, yawBaseline=${s.yawBaselineDeg.toFixed(2)}°, state=${s.challengeState}`,
+        ok: !s.calibrating && Math.abs(s.yawBaselineDeg) < 1,
       });
       out.push({
-        name: 'new median baseline tracks the true open EAR',
-        detail: `baseline ${s.earBaseline.toFixed(4)} (open ${OPEN})`,
-        ok: Math.abs(s.earBaseline - OPEN) < 0.02,
-      });
-      out.push({
-        name: 'recover threshold is reachable',
-        detail: `recover ${(s.earBaseline * BLINK_RECOVER_FACTOR).toFixed(4)} < open ${OPEN}`,
-        ok: s.earBaseline * BLINK_RECOVER_FACTOR < OPEN,
-      });
-
-      // Complete whichever action comes first, then blink / turn as required.
-      const closed = OPEN * BLINK_DIP_FACTOR * 0.8;
-      const start = performance.now();
-      for (let i = 0; i < 400 && !s.isComplete && performance.now() - start < 8000; i++) {
-        const step = s.sequence[s.stepIndex];
-        if (step === 'turn') {
-          s = t.processFrame(makeLandmarks(OPEN, 1.45));
-          s = t.processFrame(makeLandmarks(OPEN, 1.0));
-        } else {
-          s = t.processFrame(makeLandmarks(closed, 1.0));
-          await new Promise((r) => setTimeout(r, 90)); // real wall-clock closure
-          s = t.processFrame(makeLandmarks(OPEN, 1.0));
-        }
-      }
-      out.push({
-        name: 'challenge completes with natural actions (real clock)',
-        detail: `score ${s.livenessScore}/100, blinks ${s.blinkCount}/${s.requiredBlinks}, t ${(s.elapsedMs / 1000).toFixed(1)}s, "${s.currentPrompt}"`,
-        ok: s.isComplete && !s.isTimedOut,
+        name: 'blink threshold is an absolute coefficient, not a moving ratio',
+        detail: `closed enter ≥ ${BLINK_CLOSE_ENTER}, observed open coeff ${s.blinkScore.toFixed(3)}`,
+        ok: s.blinkScore < BLINK_CLOSE_ENTER,
       });
     }
 
-    // --- 2. ATTACK: a static photo (constant EAR, constant yaw) -----------------------
+    // --- 2. Natural actions complete the challenge (both possible orders) -------------
     {
+      const c = makeClock();
       const t = new LivenessTracker();
-      let s = t.processFrame(makeLandmarks(0.29, 1.0));
-      for (let i = 0; i < 2000; i++) s = t.processFrame(makeLandmarks(0.29, 1.0));
+      let s = calibrate(t, c);
+      for (let guard = 0; guard < 8 && !s.isComplete; guard++) {
+        const step = s.sequence[s.stepIndex];
+        if (step === 'turn') s = turnAndReturn(t, c);
+        else s = blinkOnce(t, c);
+        c.tick();
+      }
+      out.push({
+        name: 'challenge completes with natural blinks + head turn',
+        detail: `score ${s.livenessScore}/100, blinks ${s.blinkCount}/${s.requiredBlinks}, order [${s.sequence.join(', ')}], t ${(s.elapsedMs / 1000).toFixed(2)}s`,
+        ok: s.isComplete && !s.isTimedOut && s.blinkCount >= REQUIRED_BLINKS,
+      });
+    }
+
+    // --- 3. One blink is counted exactly once ----------------------------------------
+    {
+      const c = makeClock();
+      const t = new LivenessTracker();
+      calibrate(t, c);
+      const s = blinkOnce(t, c);
+      out.push({
+        name: 'a single blink counts 1, never 2',
+        detail: `blinks ${s.blinkCount}/${s.requiredBlinks}, closures ${s.closuresSeen}, phase ${s.blinkPhase}`,
+        ok: s.blinkCount === 1 && s.closuresSeen === 1,
+      });
+    }
+
+    // --- 4. ATTACK: a static photo (constant coefficients, constant pose) -------------
+    {
+      const c = makeClock();
+      const t = new LivenessTracker();
+      let s = calibrate(t, c);
+      for (let i = 0; i < 1200; i++) {
+        c.tick();
+        s = t.processFrame(sig(), c.now());
+      }
       out.push({
         name: 'ATTACK static photo: no blink, no turn, never completes',
-        detail: `blinks ${s.blinkCount}, closures ${s.blinkDipsSeen}, turned ${s.hasTurnedHead}, score ${s.livenessScore}`,
+        detail: `blinks ${s.blinkCount}, closures ${s.closuresSeen}, turned ${s.hasTurnedHead}, score ${s.livenessScore}, timedOut ${s.isTimedOut}`,
         ok: !s.isComplete && s.blinkCount === 0 && !s.hasTurnedHead && s.livenessScore === 0,
       });
     }
 
-    // --- 3. ATTACK: hand over the lens / sustained closure ----------------------------
+    // --- 5. ATTACK: hand over the lens / sustained closure ---------------------------
     {
+      const c = makeClock();
       const t = new LivenessTracker();
-      for (let i = 0; i < 14; i++) t.processFrame(makeLandmarks(0.30, 1.0));
-      const closed = 0.30 * BLINK_DIP_FACTOR * 0.8;
-      t.processFrame(makeLandmarks(closed, 1.0));
-      const start = performance.now();
-      while (performance.now() - start < 2500) t.processFrame(makeLandmarks(closed, 1.0));
-      const s = t.processFrame(makeLandmarks(0.30, 1.0));
+      calibrate(t, c);
+      let s = t.processFrame(sig({ blinkLeft: CLOSED_COEFF, blinkRight: CLOSED_COEFF }), c.now());
+      for (let i = 0; i < 90; i++) {
+        c.tick();
+        s = t.processFrame(sig({ blinkLeft: CLOSED_COEFF, blinkRight: CLOSED_COEFF }), c.now());
+      }
+      for (let i = 0; i < 6; i++) {
+        c.tick();
+        s = t.processFrame(sig(), c.now());
+      }
       out.push({
-        name: 'ATTACK sustained occlusion is not credited as a blink',
-        detail: `2.5 s closure -> blinks ${s.blinkCount}`,
+        name: 'ATTACK ~3 s sustained closure is never credited as a blink',
+        detail: `blinks ${s.blinkCount}, closures ${s.closuresSeen}, phase ${s.blinkPhase}`,
         ok: s.blinkCount === 0,
       });
     }
 
-    // --- 4. Randomization is live (not a fixed script an attacker can pre-record) -----
+    // --- 6. REGRESSION: moving the camera away must not fake a blink -----------------
+    // This is the exact v2 field failure. The blendshape coefficient is scale-invariant, so
+    // shrinking the face changes faceScale and nothing else.
     {
-      const seen = new Set<string>();
-      for (let i = 0; i < 200; i++) {
-        const t = new LivenessTracker();
-        seen.add(t.challengeDescription);
+      const c = makeClock();
+      const t = new LivenessTracker();
+      let s = calibrate(t, c);
+      for (let i = 0; i < 120; i++) {
+        c.tick();
+        const f = 1 - i / 160; // face shrinks to ~25% of its calibrated size
+        s = t.processFrame(
+          sig({ faceScale: BASE_SCALE * f, faceScalePx: BASE_SCALE_PX * f }),
+          c.now()
+        );
       }
       out.push({
-        name: 'challenge is randomized per attempt',
-        detail: `${seen.size} distinct challenges across 200 resets`,
-        ok: seen.size >= 3,
+        name: 'REGRESSION camera pulled away: zero phantom blinks',
+        detail: `blinks ${s.blinkCount}, closures ${s.closuresSeen}, final quality ${s.faceQuality}, iod ${s.faceScalePx.toFixed(0)}px`,
+        ok: s.blinkCount === 0 && s.closuresSeen === 0,
+      });
+    }
+
+    // --- 7. Blink updates are suspended during strong head rotation ------------------
+    {
+      const c = makeClock();
+      const t = new LivenessTracker();
+      calibrate(t, c);
+      const s = blinkOnce(t, c, 45); // 45° >> BLINK_POSE_LIMIT_DEG
+      out.push({
+        name: `blink is not counted beyond ±${BLINK_POSE_LIMIT_DEG}° yaw`,
+        detail: `blinks ${s.blinkCount}, phase ${s.blinkPhase} (yaw 45°)`,
+        ok: s.blinkCount === 0,
+      });
+    }
+
+    // --- 8. A turn needs sustained deviation AND a sustained return ------------------
+    {
+      const c = makeClock();
+      const t = new LivenessTracker();
+      calibrate(t, c);
+      // one noisy frame past the threshold
+      let s = t.processFrame(sig({ yawDeg: 60 }), c.now());
+      c.tick();
+      s = t.processFrame(sig(), c.now());
+      const afterSpike = s.hasTurnedHead;
+
+      // sustained turn, but no return
+      for (let i = 0; i < 20; i++) {
+        c.tick();
+        s = t.processFrame(sig({ yawDeg: 35 }), c.now());
+      }
+      out.push({
+        name: 'a single out-of-range frame does not satisfy the turn',
+        detail: `after 1-frame spike hasTurnedHead=${afterSpike} (needs ${TURN_DEV_DEG}° sustained)`,
+        ok: afterSpike === false,
+      });
+      out.push({
+        name: 'turn without returning to centre does not complete the action',
+        detail: `hasTurnedHead=${s.hasTurnedHead}, state=${s.challengeState}`,
+        ok: s.hasTurnedHead === false,
+      });
+    }
+
+    // --- 9. Unusable frames never advance anything -----------------------------------
+    {
+      const c = makeClock();
+      const t = new LivenessTracker();
+      calibrate(t, c);
+      let s = t.processFrame(sig({ ok: false }), c.now());
+      for (let i = 0; i < 40; i++) {
+        c.tick();
+        s = t.processFrame(sig({ ok: false }), c.now());
+      }
+      const noFace = s.faceQuality;
+      c.tick();
+      s = t.processFrame(sig({ multipleFaces: true, ok: false }), c.now());
+      out.push({
+        name: 'dropped landmarks and multi-face frames are refused, not guessed',
+        detail: `lost-face quality=${noFace}, multi-face quality=${s.faceQuality}, blinks ${s.blinkCount}`,
+        ok: noFace === 'no-face' && s.faceQuality === 'multiple-faces' && s.blinkCount === 0,
+      });
+    }
+
+    // --- 10. Randomization is live (not a fixed script an attacker can pre-record) ----
+    {
+      const seen = new Set<string>();
+      for (let i = 0; i < 200; i++) seen.add(new LivenessTracker().challengeDescription);
+      out.push({
+        name: 'challenge order is randomized per attempt',
+        detail: `${seen.size} distinct challenge orders across 200 resets`,
+        ok: seen.size >= 2,
       });
     }
 
@@ -170,8 +310,8 @@ export default function LivenessHarnessPage() {
     <main className="min-h-screen bg-slate-950 text-slate-200 p-8 font-mono text-sm">
       <h1 className="text-lg font-bold mb-1">Liveness harness (development only)</h1>
       <p className="text-xs text-slate-500 mb-6 max-w-2xl">
-        Drives the real LivenessTracker with synthetic landmark traces. No camera, no embedding, no
-        proof, no chain. Not linked from the app.
+        Drives the real LivenessTracker with synthetic MediaPipe signal traces and an injected
+        clock. No camera, no embedding, no proof, no chain. Not linked from the app.
       </p>
       <button
         onClick={run}

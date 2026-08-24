@@ -23,7 +23,12 @@ import {
   MultipleFacesError,
 } from '@/lib/ml/face';
 import { quantizeEmbedding, computeQuantizedDotProduct } from '@/lib/ml/quantize';
-import { LivenessTracker, LivenessState } from '@/lib/ml/liveness';
+import { LivenessTracker, LivenessState, BLINK_CLOSE_ENTER, TURN_DEV_DEG } from '@/lib/ml/liveness';
+import {
+  initLivenessEngine,
+  closeLivenessEngine,
+  extractLivenessSignals,
+} from '@/lib/ml/mediapipeLiveness';
 import { generateAegisClaimProof, CircuitWitness, ProverResult } from '@/lib/zk/prover';
 import {
   fetchActivePolicies,
@@ -51,6 +56,9 @@ type ClaimPhase =
   | 'success'
   | 'error';
 
+/** How often the cosmetic face-api alignment probe may run. Liveness runs every frame. */
+const ALIGN_CHECK_INTERVAL_MS = 200;
+
 export default function ClaimPage() {
   const [phase, setPhase] = useState<ClaimPhase>('select-policy');
   const [identity, setIdentity] = useState<StoredIdentity | null>(null);
@@ -68,6 +76,9 @@ export default function ClaimPage() {
   const [claimedNullifier, setClaimedNullifier] = useState<string>('');
   const [measuredSimilarity, setMeasuredSimilarity] = useState<number | null>(null);
   const [isExtracting, setIsExtracting] = useState<boolean>(false);
+  /** MediaPipe liveness engine load state. A load failure must block the claim (fail-closed). */
+  const [livenessEngineReady, setLivenessEngineReady] = useState<boolean>(false);
+  const [livenessEngineError, setLivenessEngineError] = useState<string>('');
   const [liveFace, setLiveFace] = useState<LiveFaceState>({
     detected: false,
     aligned: false,
@@ -88,6 +99,12 @@ export default function ClaimPage() {
    * can never leave two loops feeding the same LivenessTracker.
    */
   const loopGenRef = useRef<number>(0);
+  /**
+   * The face-api alignment probe only drives the viewfinder chrome (border colour, "move
+   * closer" hints) — liveness is decided by MediaPipe. Throttling it keeps two detectors off
+   * the same frame budget; MediaPipe still runs on every frame.
+   */
+  const lastAlignCheckRef = useRef<number>(0);
 
   // Callback ref: fires immediately when <video> mounts — only reliable way on mobile
   const videoCallbackRef = useCallback((node: HTMLVideoElement | null) => {
@@ -138,6 +155,23 @@ export default function ClaimPage() {
     loadPolicies();
     loadFaceApiModels().catch((err) => console.error('Model load failed:', err));
 
+    // Warm the MediaPipe liveness engine in the background. Failure is recorded but not thrown
+    // here; handleStartVerification awaits it again and refuses to open the camera if it failed.
+    initLivenessEngine()
+      .then(() => {
+        if (isMountedRef.current) {
+          setLivenessEngineReady(true);
+          setLivenessEngineError('');
+        }
+      })
+      .catch((err: unknown) => {
+        console.error('Liveness engine preload failed:', err);
+        if (isMountedRef.current) {
+          setLivenessEngineReady(false);
+          setLivenessEngineError(err instanceof Error ? err.message : String(err));
+        }
+      });
+
     const handleBeforeUnload = () => stopCamera();
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('pagehide', handleBeforeUnload);
@@ -147,6 +181,7 @@ export default function ClaimPage() {
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('pagehide', handleBeforeUnload);
       stopCamera();
+      closeLivenessEngine();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -279,27 +314,49 @@ export default function ClaimPage() {
     setPhase(nextPhase);
   }
 
-  // Real-time liveness & alignment loop. Sequential mutex prevents overlapping inference.
+  /**
+   * Real-time liveness loop.
+   *
+   * Liveness is driven ONLY by MediaPipe Face Landmarker. `extractLivenessSignals` is
+   * synchronous, so frames cannot pile up and no inference mutex is required for it — the loop
+   * simply cannot re-enter before the previous inference returns.
+   *
+   * face-api's `checkLiveFaceAlignment` still runs, throttled, but purely to drive the
+   * viewfinder chrome. It no longer feeds the challenge, which is what let a far-away face
+   * produce a phantom blink: it returns landmarks even from its "Move closer" branch.
+   */
   function runLivenessLoop() {
     const myGen = ++loopGenRef.current;
+    lastAlignCheckRef.current = 0;
 
     const checkFrame = () => {
       if (myGen !== loopGenRef.current) return; // superseded
       if (!isMountedRef.current || !videoRef.current) return;
 
-      if (!detectingRef.current) {
+      // --- liveness: MediaPipe, every frame, synchronous ---
+      try {
+        const signals = extractLivenessSignals(videoRef.current);
+        if (signals) {
+          setLivenessState(livenessTrackerRef.current.processFrame(signals));
+        }
+      } catch (err) {
+        // Fail closed: an inference error yields no state update, so nothing advances.
+        console.error('MediaPipe liveness frame failed:', err);
+      }
+
+      // --- viewfinder chrome: face-api, throttled, cosmetic only ---
+      const now = performance.now();
+      if (!detectingRef.current && now - lastAlignCheckRef.current >= ALIGN_CHECK_INTERVAL_MS) {
         detectingRef.current = true;
+        lastAlignCheckRef.current = now;
 
         checkLiveFaceAlignment(videoRef.current)
           .then((faceRes) => {
             if (myGen !== loopGenRef.current) return;
             setLiveFace(faceRes);
-            // A frame with more than one face contributes no landmarks to the challenge.
-            const landmarks = faceRes.multipleFaces ? [] : faceRes.landmarks || [];
-            setLivenessState(livenessTrackerRef.current.processFrame(landmarks));
           })
           .catch((err) => {
-            console.error('runLivenessLoop error:', err);
+            console.error('runLivenessLoop alignment error:', err);
           })
           .finally(() => {
             detectingRef.current = false;
@@ -333,6 +390,25 @@ export default function ClaimPage() {
     const preflight = await runPreflight(selectedPolicy, identity);
     if (preflight) {
       setErrorMessage(preflight);
+      setPhase('error');
+      return;
+    }
+
+    // Fail closed: without the MediaPipe liveness engine there is no way to verify liveness, so
+    // the camera is never opened and no proof can be produced. There is no bypass path.
+    setStatusMessage('Loading on-device liveness model...');
+    try {
+      await initLivenessEngine();
+      setLivenessEngineReady(true);
+      setLivenessEngineError('');
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      setLivenessEngineReady(false);
+      setLivenessEngineError(detail);
+      setErrorMessage(
+        `The on-device liveness model could not be loaded, so liveness cannot be verified and no ` +
+          `claim can be made. ${detail}`
+      );
       setPhase('error');
       return;
     }
@@ -934,6 +1010,18 @@ export default function ClaimPage() {
                 </span>
               </div>
 
+              {/* Engine status. If the model is not loaded, liveness cannot pass — no bypass. */}
+              {(!livenessEngineReady || livenessEngineError) && (
+                <div className="flex items-start gap-2 text-[11px] rounded-xl px-3 py-2 bg-red-950/40 border border-red-500/30 text-red-300">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                  <span className="leading-relaxed break-words">
+                    {livenessEngineError
+                      ? `Liveness engine unavailable — no claim can be made. ${livenessEngineError}`
+                      : 'Loading the on-device liveness model…'}
+                  </span>
+                </div>
+              )}
+
               <div
                 className={`text-center text-xs font-mono font-medium py-2 px-3 rounded-lg ${
                   timedOut
@@ -981,27 +1069,51 @@ export default function ClaimPage() {
               {/*
                 Diagnostics, not decoration. The blink failure that prompted this row was
                 invisible from the UI: the prompt read "blink once" while the thresholds that
-                made blinking impossible were private tracker state. Showing the live EAR next to
-                the value it must cross makes "my blink isn't registering" a readable condition.
+                made blinking impossible were private tracker state. These are the MediaPipe
+                blendshape/pose signals and the FSM state they drive — never pixels, embeddings,
+                idSecret, salt or any ZK private witness value.
               */}
               <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[10px] font-mono text-slate-500 pt-1">
                 <span
                   className={
-                    livenessState && livenessState.earValue > 0 &&
-                    livenessState.earValue < livenessState.earDipThreshold
+                    livenessState && livenessState.smoothedBlinkScore >= BLINK_CLOSE_ENTER
                       ? 'text-amber-400'
                       : undefined
                   }
                 >
-                  EAR {livenessState?.earValue?.toFixed(3) ?? '—'}
+                  blink {livenessState?.blinkScore?.toFixed(2) ?? '—'}
+                  {livenessState ? `~${livenessState.smoothedBlinkScore.toFixed(2)}` : ''}
+                  {` / close ≥ ${BLINK_CLOSE_ENTER}`}
+                </span>
+                <span
+                  className={
+                    livenessState && livenessState.blinkPhase !== 'open'
+                      ? 'text-amber-400'
+                      : undefined
+                  }
+                >
+                  phase {livenessState?.blinkPhase ?? '—'}
+                </span>
+                <span>
+                  yaw {livenessState?.smoothedYawDeg?.toFixed(1) ?? '—'}°
                   {livenessState && !livenessState.calibrating
-                    ? ` / dip < ${livenessState.earDipThreshold.toFixed(3)}`
+                    ? ` (Δ${(livenessState.smoothedYawDeg - livenessState.yawBaselineDeg).toFixed(1)}° / ±${TURN_DEV_DEG}°)`
                     : ''}
                 </span>
-                <span>yaw {livenessState?.yawRatio?.toFixed(2) ?? '—'}</span>
+                <span>iod {livenessState?.faceScalePx?.toFixed(0) ?? '—'}px</span>
+                <span
+                  className={
+                    livenessState?.faceQuality !== 'good' && livenessState?.faceQuality !== 'unknown'
+                      ? 'text-amber-400'
+                      : ''
+                  }
+                >
+                  q: {livenessState?.faceQuality ?? '—'}
+                </span>
                 {livenessState && !livenessState.calibrating && (
-                  <span>closures {livenessState.blinkDipsSeen}</span>
+                  <span>closures {livenessState.closuresSeen}</span>
                 )}
+                <span>{livenessState?.challengeState ?? '—'}</span>
                 <span>t {((livenessState?.elapsedMs ?? 0) / 1000).toFixed(1)}s</span>
               </div>
             </div>

@@ -51,27 +51,64 @@ liveness (§2.1) and enrolment procedure (§2.2), both of which are weaker than 
 **Threat.** A rooted device, a patched browser, or a virtual camera feeds a synthetic embedding
 straight to the prover, or replays a previous recording to satisfy the liveness challenge.
 
-**What is implemented.** An *active* software liveness challenge (`web/lib/ml/liveness.ts`) built
-on face-api.js 68-point landmarks. Per attempt it randomly draws an action order
-(blink-then-turn or turn-then-blink) and a blink count (1 or 2), and requires:
+**What is implemented.** An *active* software liveness challenge split across two modules:
 
-- each blink to be a real EAR excursion — below `baseline * 0.72`, recovering above
-  `baseline * 0.88`, with the closure lasting 40–900 ms; and
-- one head-yaw excursion past `baseline * 1.45` (or below `baseline / 1.45`) and a return to
-  within `baseline * [1/1.15, 1.15]`;
+- `web/lib/ml/mediapipeLiveness.ts` — signal extraction via **MediaPipe Face Landmarker**
+  (`@mediapipe/tasks-vision`, model and WASM served from `web/public/mediapipe/`, zero network
+  requests at runtime). It emits only the `eyeBlinkLeft` / `eyeBlinkRight` blendshape
+  coefficients, a roll-invariant head yaw in degrees, interocular scale, and a confidence value.
+- `web/lib/ml/liveness.ts` — a **pure, DOM-free state machine** that consumes those signals. It
+  holds no reference to MediaPipe, face-api, the DOM or any timer, and takes `now` as a
+  parameter, which is what makes the whole challenge deterministically testable from Node.
 
-all inside a 20 s window measured from the first usable face, with a 12-frame calibration phase
-whose EAR baseline is rejected outright if it falls outside [0.10, 0.65]. Losing the face for
-more than 2 s mid-challenge wipes all progress, so a subject cannot be swapped part-way through.
+Note the deliberate responsibility split: **face-api.js still owns identity** (the 128-D
+descriptor that feeds quantisation, commitments and the ZK proof); MediaPipe owns **liveness
+only**. The two never exchange data.
 
-`web/scripts/liveness_test.mts` (79 assertions, run `npm run test:liveness` from `web/`) verifies
-these behaviours against a virtual clock, including the boundary cases at exactly 40 ms and
-900 ms and a 28-combination sweep proving that an occlusion of any duration is never miscredited
-as a blink.
+Per attempt the challenge randomly draws an action **order** (blink-then-turn or
+turn-then-blink). The blink count is fixed at **2** and is not randomisable — a randomised
+requirement could be drawn downward, which would weaken the check. It requires:
 
-**What this defeats.** A held-up printed photo or a still image on a second screen: the test
-harness runs 623 frames of a perfectly static face and the challenge times out with score 0.
-Also a single fixed recording, since the required action order and blink count differ per attempt.
+- **two genuine blinks**, each credited only on a completed `OPEN → CLOSING → CLOSED → OPEN`
+  transition where the closure (a) lasted 80–700 ms, (b) contained at least 2 frames whose raw
+  coefficient cleared 0.5, and (c) showed *bilateral* agreement (both eyelids ≥ 0.30). Entry and
+  exit use a hysteresis band (enter ≥ 0.50, exit ≤ 0.32) so a coefficient hovering mid-band
+  cannot oscillate a counter; and
+- **one head-yaw excursion** of ≥ 18° from the calibrated neutral pose, in either direction,
+  sustained for ≥ 180 ms, followed by a return to within 8° also sustained for ≥ 180 ms;
+
+all inside a 45 s window measured from the first usable face, after a 12-frame calibration phase
+that refuses to complete while the eyes read closed. Blink updates are **suspended** beyond ±22°
+yaw, where blendshape confidence is not trustworthy — but blinks already credited are never
+revoked. Losing the face for more than 2.5 s mid-challenge wipes all progress, so a subject
+cannot be swapped part-way through.
+
+Two properties are worth calling out because they were *defects* in the previous version:
+
+- **The randomised order is binding.** Exactly one action is live at a time; the inactive
+  action's FSM still runs for telemetry but cannot increment anything. A single pre-recorded clip
+  containing both actions therefore satisfies one order and fails the other.
+- **The blink signal is absolute, not baseline-relative.** v2 derived blink from the Eye Aspect
+  Ratio of face-api's 68-point landmarks against a rolling baseline. That produced a false
+  positive whenever the camera moved *away* (EAR collapses as landmark quantisation error grows
+  relative to the eye, while the slow baseline stays high — a textbook dip-and-recovery), and it
+  progressively degraded, because each near-miss dragged the baseline down. Blendshape
+  coefficients are scale-invariant and need no baseline, so both failure modes are structurally
+  impossible rather than merely less likely.
+
+`web/scripts/liveness_test.mts` (**75 assertions, all passing**, `npm run test:liveness` from
+`web/`) drives the real state machine against synthetic signal traces with an injected clock, so
+every duration boundary is exercised exactly. It covers a one-frame coefficient spike, a sub-80 ms
+closure, a ~1 s held closure, a ~3 s occlusion, a one-eyed closure, camera distance changing in
+both directions, dropped landmarks mid-closure, multi-face frames, and non-finite (NaN/Infinity)
+signals. **Every failure path fails closed:** if MediaPipe, the camera, the model or the landmarks
+fail, there is no liveness success, no proof and no claim — there is no fallback to a dummy
+blink, dummy landmarks or hardcoded success anywhere in the subsystem.
+
+**What this defeats.** A held-up printed photo or a still image on a second screen: 1200 frames
+of a perfectly static face yield score 0 and a timeout. A held-shut-eyes or hand-over-lens
+occlusion of any duration, which is counted as a *closure* but never as a blink. And a single
+fixed recording, since the required action order differs per attempt.
 
 **What this does NOT defeat — stated plainly.**
 1. **An attacker who can produce video on demand.** A short interactive clip, a puppeteered
@@ -81,8 +118,10 @@ Also a single fixed recording, since the required action order and blink count d
    prover directly with a chosen descriptor, bypasses liveness entirely. Liveness is enforced by
    the page's own JavaScript, which the device owner fully controls. **The circuit does not
    constrain liveness, and the contract cannot observe it.**
-3. **A high-resolution replay on a good display** under favourable lighting may produce plausible
-   EAR dynamics.
+3. **A high-resolution replay on a good display** under favourable lighting will produce
+   plausible blendshape dynamics. MediaPipe's blendshapes are a *semantic* estimate of eyelid
+   position; they say nothing about whether the pixels came from a face or from a screen. There
+   is no texture, depth, reflectance or rPPG analysis in this system.
 
 **We do not claim perfect anti-spoofing.** Any statement that AegisDID prevents presentation
 attacks in general would be false.

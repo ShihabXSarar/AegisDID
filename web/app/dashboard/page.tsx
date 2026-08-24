@@ -7,6 +7,7 @@ import {
   AEGIS_AID_ABI,
   DEPLOYMENT_BLOCK,
   getPublicClient,
+  getLogsChunked,
   getExplorerTxUrl,
   fetchAllPolicies,
   checkIsIssuer,
@@ -57,6 +58,7 @@ export default function DashboardPage() {
   const [latestRoot, setLatestRoot] = useState<string>('');
   const [enrollmentCount, setEnrollmentCount] = useState<number | null>(null);
   const [events, setEvents] = useState<ClaimEvent[]>([]);
+  const [eventsError, setEventsError] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState<{ type: StatusKind; message: string } | null>(null);
   const [policies, setPolicies] = useState<PolicyInfo[]>([]);
@@ -143,27 +145,22 @@ export default function DashboardPage() {
   }, []);
 
   const fetchEvents = useCallback(async () => {
+    setEventsError('');
     try {
-      const publicClient = getPublicClient();
-      const latestBlock = await publicClient.getBlockNumber();
       const eventAbi = parseAbi([
         'event AidClaimed(uint256 indexed policyId, uint256 indexed nullifier, uint128 amount)',
       ])[0];
 
-      const allLogs = [];
-      const CHUNK = 45000n;
-      let from = DEPLOYMENT_BLOCK;
-      while (from <= latestBlock) {
-        const to = from + CHUNK > latestBlock ? latestBlock : from + CHUNK;
-        const logs = await publicClient.getLogs({
-          address: AEGIS_AID_ADDRESS,
-          event: eventAbi,
-          fromBlock: from,
-          toBlock: to,
-        });
-        allLogs.push(...logs);
-        from = to + 1n;
-      }
+      // Chunked centrally in lib/chain/client.ts. This used to inline a 45000-block span, which
+      // the public Base Sepolia RPC rejects ("eth_getLogs is limited to a 10,000 range", HTTP 413).
+      // The throw was swallowed into console.error, so events stayed [] and this panel asserted
+      // "No claim has ever been verified by this contract ... not a loading failure" while the
+      // query had in fact failed — a real claim would not have shown up here.
+      const allLogs = await getLogsChunked<{
+        policyId?: bigint;
+        nullifier?: bigint;
+        amount?: bigint;
+      }>(eventAbi);
 
       setEvents(
         allLogs
@@ -171,12 +168,15 @@ export default function DashboardPage() {
             policyId: l.args.policyId?.toString(),
             nullifier: l.args.nullifier?.toString(),
             amount: l.args.amount?.toString(),
-            txHash: l.transactionHash,
+            txHash: l.transactionHash ?? undefined,
             block: l.blockNumber?.toString(),
           }))
           .reverse()
       );
     } catch (e) {
+      // Never leave a failed query looking like an empty audit log.
+      setEvents([]);
+      setEventsError(e instanceof Error ? e.message : String(e));
       console.error('Failed to fetch events', e);
     }
   }, []);
@@ -330,7 +330,7 @@ export default function DashboardPage() {
     );
   }
 
-  function handlePublishRoot() {
+  async function handlePublishRoot() {
     if (!account) {
       setStatus({ type: 'error', message: 'Connect an issuer wallet first.' });
       return;
@@ -395,9 +395,65 @@ export default function DashboardPage() {
       }
     }
 
+    /**
+     * Re-read the authority tree immediately before signing.
+     *
+     * `latestRoot` is React state, captured when this tab last loaded. Every enrollment appends a
+     * leaf and MOVES the root, so a dashboard left open across an enrollment holds a stale value.
+     * Publishing a stale root succeeds on-chain, costs real gas, and then fails every claim with
+     * the exact "Merkle root mismatch" this publish was meant to clear — the most confusing
+     * possible outcome, because the operator watched the transaction confirm.
+     *
+     * On any drift the staged value is refreshed and NOTHING is signed: the operator gets to see
+     * the root that is actually about to go on-chain and press Publish again. On a failed re-read
+     * this fails closed rather than signing an unconfirmed root.
+     */
+    let rootToPublish = latestRoot;
+    try {
+      const res = await fetch('/api/enroll', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`the enrollment service returned HTTP ${res.status}`);
+      const data = await res.json();
+      const freshRoot = '0x' + BigInt(data.root).toString(16).padStart(64, '0');
+      const freshCount = typeof data.count === 'number' ? data.count : null;
+
+      if (freshCount === 0) {
+        setEnrollmentCount(0);
+        setStatus({
+          type: 'error',
+          message:
+            'The authority now reports zero enrollments, so the current root is the empty-tree ' +
+            'root. Nothing was signed.',
+        });
+        return;
+      }
+      if (freshRoot !== rootToPublish) {
+        setLatestRoot(freshRoot);
+        if (freshCount !== null) setEnrollmentCount(freshCount);
+        setStatus({
+          type: 'info',
+          message:
+            `The authority tree moved since this page loaded — it now holds ${
+              freshCount ?? 'an updated number of'
+            } enrollments and its root is ${freshRoot}. Nothing was signed. The staged root above ` +
+            'has been refreshed; press Publish again to publish that root.',
+        });
+        return;
+      }
+      rootToPublish = freshRoot;
+    } catch (e) {
+      setStatus({
+        type: 'error',
+        message:
+          'Could not confirm the current cohort root before signing ' +
+          `(${e instanceof Error ? e.message : String(e)}). Refusing to publish a root that may ` +
+          'already be stale — every claim against a stale root fails.',
+      });
+      return;
+    }
+
     withTx(
       `updateCohortRoot #${targetPolicyId}`,
-      () => publishCohortRoot(targetPolicyId, latestRoot),
+      () => publishCohortRoot(targetPolicyId, rootToPublish),
       fetchOnChainPolicies
     );
   }
@@ -878,7 +934,7 @@ export default function DashboardPage() {
         <div className="border-b border-slate-800 p-6 flex items-center justify-between gap-4">
           <h3 className="text-base font-bold text-white flex items-center gap-2">
             <History className="h-4 w-4 text-purple-400" />
-            Audit log · AidClaimed events ({events.length})
+            Audit log · AidClaimed events ({eventsError ? 'unknown' : events.length})
           </h3>
           <button
             onClick={fetchEvents}
@@ -888,7 +944,21 @@ export default function DashboardPage() {
           </button>
         </div>
         <div className="p-6 min-h-[180px]">
-          {events.length === 0 ? (
+          {eventsError ? (
+            <div className="flex flex-col items-center justify-center text-slate-400 space-y-2 py-8 text-center">
+              <AlertTriangle className="h-7 w-7 text-rose-400" />
+              <p className="text-sm font-medium text-rose-300">
+                Could not read AidClaimed events from {CHAIN_LABEL}
+              </p>
+              <p className="text-xs max-w-md leading-relaxed">
+                The log query failed, so the claim history is <strong>unknown</strong> — this is not
+                a statement that zero claims exist. Fix the RPC and hit Refresh.
+              </p>
+              <p className="text-[11px] font-mono text-slate-500 max-w-md break-words">
+                {eventsError}
+              </p>
+            </div>
+          ) : events.length === 0 ? (
             <div className="flex flex-col items-center justify-center text-slate-400 space-y-2 py-8 text-center">
               <AlertTriangle className="h-7 w-7 text-amber-400" />
               <p className="text-sm font-medium text-slate-300">

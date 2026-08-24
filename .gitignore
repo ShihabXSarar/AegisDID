@@ -146,3 +146,4 @@ vite.config.ts.timestamp-*
 # derived descriptors. Never commit — it is bulk biometric data with its own licence terms, and
 # it is regenerable via tools/lfw_export_raw.py.
 web/.eval/
+.next-verify
