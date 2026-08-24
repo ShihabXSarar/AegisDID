@@ -236,30 +236,87 @@ export async function readPolicyOnChain(policyId: number): Promise<PolicyInfo> {
  * contract's `updateCohortRoot` writes a root into any slot, so a non-zero root alone does
  * not prove a policy exists. Only a PolicyCreated event does.
  */
-export async function discoverPolicyIds(): Promise<number[]> {
+/**
+ * Maximum block span for a single eth_getLogs request.
+ *
+ * This is an RPC-provider limit, not a protocol one, and it is the reason log reads are chunked
+ * at all. The public Base Sepolia endpoint (https://sepolia.base.org, the default in .env.local)
+ * rejects any getLogs range wider than ~10k blocks with HTTP 413 and
+ * "eth_getLogs is limited to a 10,000 range". A previous value of 45000 was therefore rejected on
+ * the FIRST chunk, which threw out of discoverPolicyIds and surfaced as "Could not read policies
+ * from Base Sepolia" on both /claim and /dashboard — no policy was listed at all, even though
+ * every policy was perfectly readable via policies() (an eth_call, which has no range limit).
+ * Verified against the live endpoint: span 45000 fails, span 10000 succeeds and returns
+ * [101, 103, 107, 108].
+ *
+ * 9500 keeps a margin below the observed ceiling. Providers with a larger allowance simply do
+ * more, smaller requests; providers with a smaller one are handled by the fallback below.
+ */
+const GETLOGS_CHUNK = 9500n;
+
+/** Narrower retry span for providers stricter than GETLOGS_CHUNK (some cap at 2k or 1k). */
+const GETLOGS_CHUNK_FALLBACK = 900n;
+
+/** Minimal decoded-log shape shared by every chunked reader here. */
+export type ChunkedLog<TArgs> = {
+  args: TArgs;
+  transactionHash?: string | null;
+  blockNumber?: bigint | null;
+};
+
+/**
+ * Read every matching log from DEPLOYMENT_BLOCK to head, chunked to respect the provider's
+ * getLogs range cap (see GETLOGS_CHUNK).
+ *
+ * This helper exists so that every log reader in the app shares one chunking policy. Each caller
+ * having its own literal span is how the 45000 bug survived in two places at once.
+ *
+ * Failure is never converted into an empty result: if even the narrow retry span is refused, the
+ * error propagates so the caller can say "the query failed" instead of "there are no events".
+ * Those two states are indistinguishable to a reader but mean opposite things.
+ */
+export async function getLogsChunked<TArgs>(event: unknown): Promise<ChunkedLog<TArgs>[]> {
   const publicClient = getPublicClient();
-  const ids = new Set<number>();
   const latestBlock = await publicClient.getBlockNumber();
-  const CHUNK = 45000n;
-  const eventAbi = AEGIS_AID_ABI.find(
-    (x) => x.type === 'event' && x.name === 'PolicyCreated'
-  ) as any;
+  const out: ChunkedLog<TArgs>[] = [];
+
+  const getLogsRange = (fromBlock: bigint, toBlock: bigint) =>
+    publicClient.getLogs({
+      address: AEGIS_AID_ADDRESS,
+      // The event ABI is supplied by the caller (looked up at runtime or parsed inline), so viem
+      // cannot infer decoded args here; TArgs is the caller's assertion about the shape.
+      event: event as any,
+      fromBlock,
+      toBlock,
+    }) as Promise<ChunkedLog<TArgs>[]>;
 
   let from = DEPLOYMENT_BLOCK;
   while (from <= latestBlock) {
-    const to = from + CHUNK > latestBlock ? latestBlock : from + CHUNK;
-    const logs = await publicClient.getLogs({
-      address: AEGIS_AID_ADDRESS,
-      event: eventAbi,
-      fromBlock: from,
-      toBlock: to,
-    });
-    for (const log of logs) {
-      // eventAbi is untyped (looked up at runtime), so viem cannot infer decoded args here.
-      const args = (log as unknown as { args?: { policyId?: bigint } }).args;
-      if (args?.policyId != null) ids.add(Number(args.policyId));
+    const to = from + GETLOGS_CHUNK > latestBlock ? latestBlock : from + GETLOGS_CHUNK;
+    try {
+      out.push(...(await getLogsRange(from, to)));
+    } catch {
+      // The provider refused this span. Re-walk exactly this window in smaller steps rather than
+      // giving up. If the narrower span is refused too, the error propagates — a PARTIAL result
+      // must never be presented as complete.
+      for (let sub = from; sub <= to; sub += GETLOGS_CHUNK_FALLBACK + 1n) {
+        const subTo = sub + GETLOGS_CHUNK_FALLBACK > to ? to : sub + GETLOGS_CHUNK_FALLBACK;
+        out.push(...(await getLogsRange(sub, subTo)));
+      }
     }
     from = to + 1n;
+  }
+
+  return out;
+}
+
+export async function discoverPolicyIds(): Promise<number[]> {
+  const eventAbi = AEGIS_AID_ABI.find((x) => x.type === 'event' && x.name === 'PolicyCreated');
+  const logs = await getLogsChunked<{ policyId?: bigint }>(eventAbi);
+
+  const ids = new Set<number>();
+  for (const log of logs) {
+    if (log.args?.policyId != null) ids.add(Number(log.args.policyId));
   }
 
   return [...ids].sort((a, b) => a - b);

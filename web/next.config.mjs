@@ -1,6 +1,12 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // `next build` and `next dev` share this directory, so a verification build run while the
+  // dev server is up deletes the dev server's compiled CSS/JS and every page starts serving
+  // unstyled HTML (the dev server keeps referencing /_next/static/css/app/layout.css, which
+  // the production build replaces with a content-hashed filename -> 404). Use `npm run
+  // build:verify` to build into .next-verify instead and leave a running dev server intact.
+  distDir: process.env.NEXT_DIST_DIR || '.next',
   // Disable image optimization so logo loads correctly through tunnel/mobile
   images: {
     unoptimized: true,

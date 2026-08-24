@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev -H 0.0.0.0 -p 3000",
     "build": "next build",
+    "build:verify": "node -e \"process.env.NEXT_DIST_DIR='.next-verify';const{spawnSync}=require('child_process');process.exit(spawnSync(process.platform==='win32'?'npx.cmd':'npx',['next','build'],{stdio:'inherit',env:process.env,shell:process.platform==='win32'}).status??1)\"",
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
@@ -16,6 +17,7 @@
   "dependencies": {
     "@mediapipe/camera_utils": "0.3.1675466862",
     "@mediapipe/face_mesh": "0.4.1633559619",
+    "@mediapipe/tasks-vision": "^1.0.1",
     "@noble/curves": "^1.9.1",
     "circomlibjs": "^0.1.7",
     "clsx": "^2.1.1",
